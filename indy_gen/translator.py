@@ -1,14 +1,64 @@
 from indy_gen.function import FunctionParameter, IndyFunction
 
-from .utils import go_param_string, c_param_string, types_string, to_camel_case
+from .utils import to_camel_case, go_param_string
 
+
+_CALLBACK_ERRCHECK = '''
+    if err != nil {
+        panic("Invalid handle in callback!")
+    }
+'''
 
 class GoTranslator:
     def __init__(self, output_path):
         self._output_path = output_path
 
     def translate(self, name, functions):
-        go_functions = {name: GoFunction.from_indy_function(f) for f in functions.values()}
+        go_functions = {f.name: GoFunction.from_indy_function(f) for f in functions.values()}
+
+        if 'indy_open_wallet' in go_functions:
+            open_wallet = go_functions['indy_open_wallet']
+            result_strings = self._generate_result_strings(open_wallet)
+            callback_name, callback_export, callback_code = self._generate_callback(open_wallet, result_strings[1], result_strings[2])
+            print(result_strings)
+            print(callback_name)
+            print(callback_export)
+            print(callback_code)
+
+    def _generate_callback(self, go_function, result_initialisation, result_sending):
+        callback_name = go_function.name + 'Callback'
+        callback_export = '//export ' + callback_name
+        callback_params = go_param_string(go_function.callback.parameters)
+        signature = f'func {callback_name}({callback_params})'
+        first_param_name = go_function.callback.parameters[0].name
+        deregister = f'resCh, err := resolver.DeregisterCall({first_param_name})'
+        callback_code = (f'{signature} {{\n\t{deregister}{_CALLBACK_ERRCHECK}\n'
+                         f'\t{result_initialisation}{result_sending}\n}}')
+        return callback_name, callback_export, callback_code
+
+    def _generate_result_strings(self, go_function):
+        if len(go_function.callback.parameters) > 2:
+            return self._generate_result_strings_for_complex_result(go_function)
+        else:
+            return '', '', f'resCh <- {go_function.callback.parameters[0].name}'
+
+    def _generate_result_strings_for_complex_result(self, go_function):
+        result_struct_name = f'{go_function.name}Result'
+        result_fields = go_function.callback.parameters[1:]
+        struct_field_declarations = []
+        for field in result_fields:
+            struct_field_declarations.append(f'{field.name} {field.type}')
+        field_declaration_string = '\n\t'.join(struct_field_declarations)
+        struct_declaration = f'type {result_struct_name} struct {{\n\t{field_declaration_string}\n}}'
+
+        struct_field_initialisations = []
+        for field in result_fields:
+            struct_field_initialisations.append(f'{field.name}: {field.name}')
+        field_initialisation_string = ',\n\t\t'.join(struct_field_initialisations)
+        struct_initialisation = f'res := &{result_struct_name} {{\n\t\t{field_initialisation_string},\n\t}}\n'
+
+        return struct_declaration, struct_initialisation, '\tresCh <- res'
+
 
 
 class GoFunction:
