@@ -12,6 +12,10 @@ def types_string(params):
     return ', '.join(p.type for p in params)
 
 
+def names_string(params):
+    return ', '.join(p.name for p in params)
+
+
 def to_camel_case(function_name):
     words = function_name.split('_')
     return ''.join([words[0]] + [word.capitalize() for word in words[1:]])

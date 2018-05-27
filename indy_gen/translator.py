@@ -1,6 +1,6 @@
 from indy_gen.function import FunctionParameter, IndyFunction
 
-from .utils import to_camel_case, go_param_string
+from .utils import to_camel_case, go_param_string, types_string, c_param_string, names_string
 
 
 _CALLBACK_ERRCHECK = '''
@@ -20,10 +20,15 @@ class GoTranslator:
             open_wallet = go_functions['indy_open_wallet']
             result_strings = self._generate_result_strings(open_wallet)
             callback_name, callback_export, callback_code = self._generate_callback(open_wallet, result_strings[1], result_strings[2])
+            open_wallet_c = functions['indy_open_wallet']
+            c_proxy_name, c_proxy_extern, c_proxy_code = self._generate_c_proxy(open_wallet_c, callback_name)
             print(result_strings)
             print(callback_name)
             print(callback_export)
             print(callback_code)
+            print(c_proxy_name)
+            print(c_proxy_extern)
+            print(c_proxy_code)
 
     def _generate_callback(self, go_function, result_initialisation, result_sending):
         callback_name = go_function.name + 'Callback'
@@ -59,6 +64,21 @@ class GoTranslator:
 
         return struct_declaration, struct_initialisation, '\tresCh <- res'
 
+    def _generate_c_proxy(self, indy_function, go_callback_name):
+        extern_declaration_types = types_string(indy_function.callback.parameters)
+        extern_declaration = f'extern void {go_callback_name}({extern_declaration_types});'
+        c_proxy_name = indy_function.name + '_proxy'
+        fp_param = FunctionParameter('fp', 'void *')
+        handle_param = FunctionParameter('handle', 'int32_t')
+        all_params = [fp_param, handle_param] + indy_function.parameters
+        c_proxy_types_declaration = c_param_string(all_params)
+        c_proxy_signature = f'{indy_function.return_type} {c_proxy_name}({c_proxy_types_declaration})'
+        indy_function_types = types_string(all_params[1:])
+        function_cast = f'{indy_function.return_type} (*func)({indy_function_types}, void *) = fp;'
+        function_arguments = names_string(all_params[1:])
+        function_invocation = f'return func({function_arguments}, &{go_callback_name});'
+        c_proxy_code = f'{c_proxy_signature} {{\n\t{function_cast}\n\t{function_invocation}\n}}'
+        return c_proxy_name, extern_declaration, c_proxy_code
 
 
 class GoFunction:
