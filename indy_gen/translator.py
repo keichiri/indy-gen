@@ -1,3 +1,5 @@
+import os
+
 from indy_gen.function import FunctionParameter, IndyFunction
 
 from .utils import to_camel_case, go_param_string, types_string, c_param_string, names_string
@@ -26,16 +28,12 @@ _RESULT_RETRIEVING = '''
     res := _res.({expected_type})
 '''
 _RESULT_RETRIEVING_CHECK_SINGLE = '''
-    if res != 0 {{
+    if res != 0 {
         err = fmt.Errorf("Libindy returned code: %d", res)
-        return err
-    }}
 '''
 _RESULT_RETRIEVING_CHECK_MULTIPLE = '''
     if res.{code_field_name} != 0 {{
         err = fmt.Errorf("Libindy returned code: %d", res.{code_field_name})
-        return {result_var_names}
-    }}
 '''
 
 class GoTranslator:
@@ -43,6 +41,8 @@ class GoTranslator:
         'string': '*C.char',
         'int32': 'int32_t',
         'uint32': 'uint32_t',
+        'int': 'int64_t',
+        'uint64': 'uint64_t',
     }
 
 
@@ -50,26 +50,55 @@ class GoTranslator:
         self._output_path = output_path
 
     def translate(self, name, functions):
-        go_functions = {f.name: GoFunction.from_indy_function(f) for f in functions.values()}
+        callbacks = []
+        c_proxy_declarations = []
+        c_proxy_extern_declarations = []
+        c_proxies = []
+        cores = []
 
-        funcs = []
-        for name, c_func in functions.items():
+        for func_name, c_func in functions.items():
             go_function = GoFunction.from_indy_function(c_func)
             result_strings = self._generate_result_strings(go_function)
-            callback_name, callback_export, callback_code = self._generate_callback(go_function, result_strings[1], result_strings[2])
+            callback_name, callback_code = self._generate_callback(go_function, result_strings[1], result_strings[2])
             c_proxy_name, c_proxy_declaration, c_proxy_extern, c_proxy_code = self._generate_c_proxy(c_func, callback_name)
+            core_code = self._generate_core(go_function, c_func.name, c_proxy_name, result_strings[3])
 
-            print(result_strings)
-            print(callback_name)
-            print(callback_export)
-            print(callback_code)
-            print(c_proxy_name)
-            print(c_proxy_declaration)
-            print(c_proxy_extern)
-            print(c_proxy_code)
-            core = self._generate_core(go_function, c_func.name, c_proxy_name, result_strings[3])
-            print(core)
+            callbacks.append(callback_code)
+            c_proxy_declarations.append(c_proxy_declaration)
+            c_proxy_extern_declarations.append(c_proxy_extern)
+            c_proxies.append(c_proxy_code)
+            cores.append(core_code)
 
+        if cores:
+            self._populate_c_file(name, c_proxy_extern_declarations, c_proxies)
+            self._populate_go_file(name, c_proxy_declarations, callbacks, cores)
+
+    def _populate_c_file(self, domain, extern_declarations, proxies):
+        full_path = os.path.join(self._output_path, domain + '.c')
+
+        with open(full_path, 'w') as f:
+            f.write('#include <stdint.h>\n\n')
+            f.writelines(extern_declarations)
+            f.write('\n')
+            f.write('\n'.join(proxies))
+            f.write('\n')
+
+    def _populate_go_file(self, domain, c_proxy_declarations, callbacks, core_functions):
+        full_path = os.path.join(self._output_path, domain + '.go')
+
+        with open(full_path, 'w') as f:
+            f.write('package indy\n\n')
+            f.write('/*\n')
+            f.write('#include <stdint.h>\n')
+            f.write('\n'.join(c_proxy_declarations))
+            f.write('\n')
+            f.write('*/\n')
+            f.write('import "C"\n\n')
+            f.write('import (\n\t"fmt"\n\t"log"\n\t"unsafe"\n)\n\n')
+            f.write('\n\n'.join(core_functions))
+            f.write('\n\n')
+            f.write('\n\n'.join(callbacks))
+            f.write('\n\n')
 
     def _generate_callback(self, go_function, result_initialisation, result_sending):
         callback_name = go_function.name[0].lower() + go_function.name[1:] + 'Callback'
@@ -78,9 +107,9 @@ class GoTranslator:
         signature = f'func {callback_name}({callback_params})'
         first_param_name = go_function.callback.parameters[0].name
         deregister = f'resCh, err := resolver.DeregisterCall({first_param_name})'
-        callback_code = (f'{signature} {{\n\t{deregister}{_CALLBACK_ERRCHECK}\n'
+        callback_code = (f'{callback_export}\n{signature} {{\n\t{deregister}{_CALLBACK_ERRCHECK}\n'
                          f'\t{result_initialisation}{result_sending}\n}}')
-        return callback_name, callback_export, callback_code
+        return callback_name, callback_code
 
     def _generate_result_strings(self, go_function):
         if len(go_function.callback.parameters) > 2:
@@ -90,7 +119,7 @@ class GoTranslator:
             callback_res_type = go_function.callback.parameters[0].type
             sending = f'resCh <- {callback_res_name}'
             receiving = _RESULT_RETRIEVING.format(expected_type=callback_res_type)
-            receiving = f'{receiving}\n\t{_RESULT_RETRIEVING_CHECK_SINGLE}'
+            receiving = f'{receiving}\t{_RESULT_RETRIEVING_CHECK_SINGLE}'
             return '', '', sending, receiving
 
     def _generate_result_strings_for_complex_result(self, go_function):
@@ -108,27 +137,28 @@ class GoTranslator:
             struct_field_initialisations.append(f'{field.name}: {field.name}')
         field_initialisation_string = ',\n\t\t'.join(struct_field_initialisations)
         struct_initialisation = f'res := &{result_struct_name} {{\n\t\t{field_initialisation_string},\n\t}}\n'
+        receiving = _RESULT_RETRIEVING.format(expected_type='*' + result_struct_name)
+        struct_err_field_name = go_function.callback.parameters[1].name
+        receiving += f'\t{_RESULT_RETRIEVING_CHECK_MULTIPLE}'.format(code_field_name=struct_err_field_name)
 
-        return struct_declaration, struct_initialisation, '\tresCh <- res', _RESULT_RETRIEVING.format(expected_type='*' + result_struct_name)
+        return struct_declaration, struct_initialisation, '\tresCh <- res', receiving
 
     def _generate_c_proxy(self, indy_function, go_callback_name):
-        try:
-            extern_declaration_types = types_string(indy_function.callback.parameters)
-            extern_declaration = f'extern void {go_callback_name}({extern_declaration_types});'
-            c_proxy_name = indy_function.name + '_proxy'
-            fp_param = FunctionParameter('fp', 'void *')
-            handle_param = FunctionParameter('handle', 'int32_t')
-            all_params = [fp_param, handle_param] + indy_function.parameters
-            c_proxy_types_declaration = c_param_string(all_params)
-            c_proxy_signature = f'{indy_function.return_type} {c_proxy_name}({c_proxy_types_declaration})'
-            indy_function_types = types_string(all_params[1:])
-            function_cast = f'{indy_function.return_type} (*func)({indy_function_types}, void *) = fp;'
-            function_arguments = names_string(all_params[1:])
-            function_invocation = f'return func({function_arguments}, &{go_callback_name});'
-            c_proxy_code = f'{c_proxy_signature} {{\n\t{function_cast}\n\t{function_invocation}\n}}'
-            return c_proxy_name, c_proxy_signature + ';', extern_declaration, c_proxy_code
-        except Exception as e:
-            raise Exception(f'Failed to generate function for: {indy_function.name}. Exception: {e}')
+        extern_declaration_types = types_string(indy_function.callback.parameters)
+        extern_declaration = f'extern void {go_callback_name}({extern_declaration_types});'
+        c_proxy_name = indy_function.name + '_proxy'
+        fp_param = FunctionParameter('fp', 'void *')
+        handle_param = FunctionParameter('handle', 'int32_t')
+        all_params = [fp_param, handle_param] + indy_function.parameters
+        c_proxy_declaration = f'{indy_function.return_type} {c_proxy_name}({types_string(all_params)});'
+        c_proxy_types_declaration = c_param_string(all_params)
+        c_proxy_signature = f'{indy_function.return_type} {c_proxy_name}({c_proxy_types_declaration})'
+        indy_function_types = types_string(all_params[1:])
+        function_cast = f'{indy_function.return_type} (*func)({indy_function_types}, void *) = fp;'
+        function_arguments = names_string(all_params[1:])
+        function_invocation = f'return func({function_arguments}, &{go_callback_name});'
+        c_proxy_code = f'{c_proxy_signature} {{\n\t{function_cast}\n\t{function_invocation}\n}}'
+        return c_proxy_name, c_proxy_declaration, extern_declaration, c_proxy_code
 
     def _generate_core(self, go_indy_function, indy_function_name, c_proxy_name, result_retrieval):
         return_parameters = go_indy_function.callback.parameters[1:]
@@ -162,28 +192,34 @@ class GoTranslator:
         c_call = f'code := C.{c_proxy_name}({variable_names})'
         c_call_check = _C_CALL_CHECK.format(result_var_names=return_var_names_string)
 
-        retrieval_check = _RESULT_RETRIEVING_CHECK_MULTIPLE.format(code_field_name=go_indy_function.callback.parameters[1].name,
-                                                                   result_var_names=return_var_names_string)
-
         result_var_assignments = [f'{var_name} = res.{var_name.replace("res_", "")}' for var_name in return_var_names]
         result_var_assignment_string = '\n\t' + '\n\t'.join(result_var_assignments)
+        retrieval_and_check = result_retrieval + f'\t\treturn {return_var_names_string}\n\t}}\n'
 
         return (f'{signature} {{\n\t{return_vars_init_string}\n\t{register_call}'
-                f'\n\n\t{variable_setup_string}\n\t{c_call}\n\t{c_call_check}'
-                f'\n\t{result_retrieval}\n\t{retrieval_check}'
-                f'\t{result_var_assignment_string}\n\treturn {return_var_names_string}\n}}')
-
+                f'\n\n\t{variable_setup_string}\n\n\t{c_call}\t{c_call_check}'
+                f'\t{retrieval_and_check}'
+                f'\t{result_var_assignment_string}\n\n\treturn {return_var_names_string}\n}}')
 
     def _setup_variables(self, variables):
         variable_names = []
         variable_setups = []
 
         for var in variables:
-            name, setup = self._setup_var(var)
+            if isinstance(var, GoFunction):
+                name, setup = self._setup_func_var(var)
+            else:
+                name, setup = self._setup_var(var)
             variable_names.append(name)
             variable_setups.append(setup)
 
         return variable_names, variable_setups
+
+    def _setup_func_var(self, var):
+        c_var_name = 'c_' + var.name
+        var_declaration = f'var {c_var_name} unsafe.Pointer'
+        setup = f'{var_declaration}\n\t{c_var_name} = unsafe.Pointer({var.name})'
+        return c_var_name, setup
 
     def _setup_var(self, var):
         c_var_name = 'c_' + var.name
@@ -196,6 +232,10 @@ class GoTranslator:
             setup = f'{c_var_name} = C.int32_t({var.name})'
         elif var.type == 'uint32':
             setup = f'{c_var_name} = C.uint32_t({var.name})'
+        elif var.type == 'int':
+            setup = f'{c_var_name} = C.int64_t({var.name})'
+        elif var.type == 'uint64':
+            setup = f'{c_var_name} = C.uint64_t({var.name})'
         else:
             raise Exception(f'No setup for var type: {var.type}')
 
@@ -253,10 +293,10 @@ class GoFunction:
 
             return cls(go_func_name, go_return_type, go_func_params, go_func_callback)
         except Exception as e:
-            raise Exception(f'Failed to creat go function {indy_function.name}. Exception {e}') from e
+            raise Exception(f'Failed to create go function {indy_function.name}. Exception {e}') from e
 
     def __init__(self, name, return_type, parameters, callback):
-        self.name = name
+        self.name = name.replace('*', '')
         self.return_type = return_type
         self.parameters = parameters
         self.callback = callback
@@ -269,3 +309,7 @@ class GoFunction:
 
     def __repr__(self):
         return str(self)
+
+    @property
+    def type(self):
+        return f'func({types_string(self.parameters)})({self.return_type})'

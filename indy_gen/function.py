@@ -129,3 +129,7 @@ class IndyFunction:
 
     def __repr__(self):
         return str(self)
+
+    @property
+    def type(self):
+        return 'void *'

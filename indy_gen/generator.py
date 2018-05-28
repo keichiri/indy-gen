@@ -69,6 +69,7 @@ class Generator:
     def generate_output_files(self):
         declarations = self._header_parser.parse_indy_header_files()
 
-        for domain, declarations in declarations.items():
+        for header_file_name, declarations in declarations.items():
+            domain = header_file_name.replace('indy_', '').replace('.h', '')
             self._go_translator.translate(domain, declarations)
 
