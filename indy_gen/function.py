@@ -4,7 +4,7 @@ from .utils import split_into_parameters
 
 
 class FunctionParameter:
-    __slots__ = 'name', 'type', 'qualifiers'
+    __slots__ = 'name', 'type', 'original_type', 'qualifiers'
 
 
     @classmethod
@@ -25,9 +25,12 @@ class FunctionParameter:
         return cls(name, type, qualifiers)
 
 
-    def __init__(self, name, type, qualifiers=None):
+    def __init__(self, name, type, original_type=None, qualifiers=None):
+        if name == 'type':
+            name = 'type_'
         self.name = name
         self.type = type
+        self.original_type = original_type
         if not qualifiers:
             self.qualifiers = []
         else:

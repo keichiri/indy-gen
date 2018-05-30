@@ -6,14 +6,14 @@ from .utils import to_camel_case, go_param_string, types_string, c_param_string,
 
 
 _REGISTER_CALL = '''
-	pointer, handle, resCh, err := resolver.RegisterCall("{function_name}")
+	pointer, commandHandle, resCh, err := resolver.RegisterCall("{function_name}")
 	if err != nil {{
 	    err = fmt.Errorf("Failed to register call for {function_name}. Error: %s", err)
 	    return {result_var_names}
 	}}
 '''
 _CALLBACK_ERRCHECK = '''
-    if err != nil {
+    if deregisterErr != nil {
         panic("Invalid handle in callback!")
     }
 '''
@@ -43,6 +43,16 @@ class GoTranslator:
         'uint32': 'uint32_t',
         'int': 'int64_t',
         'uint64': 'uint64_t',
+        '*uint8': '*C.uint8_t'
+    }
+
+    C_TO_CGO_TYPES = {
+        'unsigned long long': 'C.ulonglong',
+        'int32_t': 'C.int32_t',
+        'uint32_t': 'C.uint32_t',
+        'unsigned int': 'C.uint',
+        'long': 'C.long',
+        'uint8_t*': 'C.uint8_t'
     }
 
 
@@ -54,6 +64,7 @@ class GoTranslator:
         c_proxy_declarations = []
         c_proxy_extern_declarations = []
         c_proxies = []
+        result_struct_definitions = []
         cores = []
 
         for func_name, c_func in functions.items():
@@ -68,34 +79,38 @@ class GoTranslator:
             c_proxy_extern_declarations.append(c_proxy_extern)
             c_proxies.append(c_proxy_code)
             cores.append(core_code)
+            result_struct_definitions.append(result_strings[0])
 
         if cores:
             self._populate_c_file(name, c_proxy_extern_declarations, c_proxies)
-            self._populate_go_file(name, c_proxy_declarations, callbacks, cores)
+            self._populate_go_file(name, c_proxy_declarations, callbacks, result_struct_definitions, cores)
 
     def _populate_c_file(self, domain, extern_declarations, proxies):
         full_path = os.path.join(self._output_path, domain + '.c')
 
         with open(full_path, 'w') as f:
             f.write('#include <stdint.h>\n\n')
-            f.writelines(extern_declarations)
-            f.write('\n')
-            f.write('\n'.join(proxies))
+            f.write('\n'.join(extern_declarations))
+            f.write('\n\n\n')
+            f.write('\n\n\n'.join(proxies))
             f.write('\n')
 
-    def _populate_go_file(self, domain, c_proxy_declarations, callbacks, core_functions):
+    def _populate_go_file(self, domain, c_proxy_declarations, callbacks, result_struct_defintions, core_functions):
         full_path = os.path.join(self._output_path, domain + '.go')
 
         with open(full_path, 'w') as f:
             f.write('package indy\n\n')
             f.write('/*\n')
+            f.write('#include <stdlib.h>\n')
             f.write('#include <stdint.h>\n')
             f.write('\n'.join(c_proxy_declarations))
             f.write('\n')
             f.write('*/\n')
             f.write('import "C"\n\n')
-            f.write('import (\n\t"fmt"\n\t"log"\n\t"unsafe"\n)\n\n')
+            f.write('import (\n\t"fmt"\n\t"unsafe"\n)\n\n')
             f.write('\n\n'.join(core_functions))
+            f.write('\n\n')
+            f.write('\n\n'.join(result_struct_defintions))
             f.write('\n\n')
             f.write('\n\n'.join(callbacks))
             f.write('\n\n')
@@ -106,7 +121,7 @@ class GoTranslator:
         callback_params = go_param_string(go_function.callback.parameters)
         signature = f'func {callback_name}({callback_params})'
         first_param_name = go_function.callback.parameters[0].name
-        deregister = f'resCh, err := resolver.DeregisterCall({first_param_name})'
+        deregister = f'resCh, deregisterErr := resolver.DeregisterCall({first_param_name})'
         callback_code = (f'{callback_export}\n{signature} {{\n\t{deregister}{_CALLBACK_ERRCHECK}\n'
                          f'\t{result_initialisation}{result_sending}\n}}')
         return callback_name, callback_code
@@ -148,8 +163,7 @@ class GoTranslator:
         extern_declaration = f'extern void {go_callback_name}({extern_declaration_types});'
         c_proxy_name = indy_function.name + '_proxy'
         fp_param = FunctionParameter('fp', 'void *')
-        handle_param = FunctionParameter('handle', 'int32_t')
-        all_params = [fp_param, handle_param] + indy_function.parameters
+        all_params = [fp_param] + indy_function.parameters
         c_proxy_declaration = f'{indy_function.return_type} {c_proxy_name}({types_string(all_params)});'
         c_proxy_types_declaration = c_param_string(all_params)
         c_proxy_signature = f'{indy_function.return_type} {c_proxy_name}({c_proxy_types_declaration})'
@@ -161,12 +175,12 @@ class GoTranslator:
         return c_proxy_name, c_proxy_declaration, extern_declaration, c_proxy_code
 
     def _generate_core(self, go_indy_function, indy_function_name, c_proxy_name, result_retrieval):
+        if go_indy_function.name == 'CryptoSign':
+            x = 3
         return_parameters = go_indy_function.callback.parameters[1:]
+        return_parameters[0], return_parameters[-1] = return_parameters[-1], return_parameters[0]
         return_types = [param.type for param in return_parameters]
-        return_types.pop()
-        return_types.append('error')
         return_var_names = ['res_' + param.name for param in return_parameters]
-        return_var_names[0], return_var_names[-1] = return_var_names[-1], return_var_names[0]
         return_var_names_string = ', '.join(return_var_names)
         return_vars_init = []
         for name, type in zip(return_var_names, return_types):
@@ -181,18 +195,21 @@ class GoTranslator:
 
         register_call = _REGISTER_CALL.format(function_name=indy_function_name,
                                               result_var_names=return_var_names_string)
-        handle = FunctionParameter('handle', 'int32')
-        variables = [handle] + go_indy_function.parameters
+        # handle = FunctionParameter('commandHandle', 'int32')
+        # variables = [handle] + go_indy_function.parameters
+        variables = go_indy_function.parameters
 
-        variable_names, variable_setups = self._setup_variables(variables)
+        variable_names, variable_passing, variable_setups = self._setup_variables(variables)
         variable_setup_string = '\n\n\t'.join(variable_setups)
         variable_names.insert(0, 'pointer')
-        variable_names = ', '.join(variable_names)
+        variable_passing.insert(0, 'pointer')
+        variable_names = ', '.join(variable_passing)
 
         c_call = f'code := C.{c_proxy_name}({variable_names})'
         c_call_check = _C_CALL_CHECK.format(result_var_names=return_var_names_string)
 
-        result_var_assignments = [f'{var_name} = res.{var_name.replace("res_", "")}' for var_name in return_var_names]
+        result_var_assignments = [f'{var_name} = res.{var_name.replace("res_", "")}' for var_name in return_var_names
+                                  if var_name != 'res_err']
         result_var_assignment_string = '\n\t' + '\n\t'.join(result_var_assignments)
         retrieval_and_check = result_retrieval + f'\t\treturn {return_var_names_string}\n\t}}\n'
 
@@ -203,45 +220,50 @@ class GoTranslator:
 
     def _setup_variables(self, variables):
         variable_names = []
+        variable_passings = []
         variable_setups = []
 
         for var in variables:
             if isinstance(var, GoFunction):
-                name, setup = self._setup_func_var(var)
+                name, passing, setup = self._setup_func_var(var)
             else:
-                name, setup = self._setup_var(var)
+                name, passing, setup = self._setup_var(var)
             variable_names.append(name)
+            variable_passings.append(passing)
             variable_setups.append(setup)
 
-        return variable_names, variable_setups
+        return variable_names, variable_passings, variable_setups
 
     def _setup_func_var(self, var):
         c_var_name = 'c_' + var.name
         var_declaration = f'var {c_var_name} unsafe.Pointer'
-        setup = f'{var_declaration}\n\t{c_var_name} = unsafe.Pointer({var.name})'
-        return c_var_name, setup
+        setup = f'{var_declaration}\n\t{c_var_name} = unsafe.Pointer(&{var.name})'
+        return c_var_name, c_var_name, setup
 
     def _setup_var(self, var):
         c_var_name = 'c_' + var.name
+        passing = c_var_name
         c_var_type = self.GO_TO_CGO_TYPES[var.type]
-        var_declaration = f'var {c_var_name} {c_var_type}'
         if var.type == 'string':
+            var_declaration = f'var {c_var_name} {c_var_type}'
             setup = (f'if {var.name} != "" {{\n\t\t{c_var_name} = C.CString({var.name})\n\t\t'
                      f'defer C.free(unsafe.Pointer({c_var_name}))\n\t}}')
+            setup = f'{var_declaration}\n\t{setup}'
         elif var.type == 'int32':
-            setup = f'{c_var_name} = C.int32_t({var.name})'
+            setup = f'{c_var_name} := {self.C_TO_CGO_TYPES[var.original_type]}({var.name})'
         elif var.type == 'uint32':
-            setup = f'{c_var_name} = C.uint32_t({var.name})'
+            setup = f'{c_var_name} := {self.C_TO_CGO_TYPES[var.original_type]}({var.name})'
         elif var.type == 'int':
-            setup = f'{c_var_name} = C.int64_t({var.name})'
+            setup = f'{c_var_name} := {self.C_TO_CGO_TYPES[var.original_type]}({var.name})'
         elif var.type == 'uint64':
-            setup = f'{c_var_name} = C.uint64_t({var.name})'
+            setup = f'{c_var_name} := {self.C_TO_CGO_TYPES[var.original_type]}({var.name})'
+        elif var.type == '*uint8':
+            setup = f'{c_var_name} := {self.C_TO_CGO_TYPES[var.original_type]}(*{var.name})'
+            passing = '&' + passing
         else:
             raise Exception(f'No setup for var type: {var.type}')
 
-        setup = f'{var_declaration}\n\t{setup}'
-
-        return c_var_name, setup
+        return c_var_name, passing, setup
 
 
 
@@ -254,7 +276,7 @@ class GoFunction:
         'const char *const': 'string',
         'char*': 'string',
         'void': '',
-        'uint8_t*': 'string',
+        'uint8_t*': '*uint8',
         'uint32_t': 'uint32',
         'unsigned int': 'uint32',
         'int32_t*': '*int32',
@@ -271,7 +293,7 @@ class GoFunction:
     @classmethod
     def from_indy_function(cls, indy_function):
         try:
-            camel_case_name = to_camel_case(indy_function.name.lstrip('indy_'))
+            camel_case_name = to_camel_case(indy_function.name.replace('indy_', ''))
             go_func_name = camel_case_name[0].title() + camel_case_name[1:]
 
             go_func_params = []
@@ -281,7 +303,7 @@ class GoFunction:
                 else:
                     go_param_type = cls.TYPE_MAP[param.type]
                     go_param_name = to_camel_case(param.name)
-                    go_param = FunctionParameter(go_param_name, go_param_type)
+                    go_param = FunctionParameter(go_param_name, go_param_type, original_type=param.type)
                     go_func_params.append(go_param)
 
             go_return_type = cls.TYPE_MAP[indy_function.return_type]
@@ -296,7 +318,10 @@ class GoFunction:
             raise Exception(f'Failed to create go function {indy_function.name}. Exception {e}') from e
 
     def __init__(self, name, return_type, parameters, callback):
-        self.name = name.replace('*', '')
+        name = name.replace('*', '')
+        if name == 'type':
+            name = 'type_'
+        self.name = name
         self.return_type = return_type
         self.parameters = parameters
         self.callback = callback
