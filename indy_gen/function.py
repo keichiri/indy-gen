@@ -22,7 +22,7 @@ class FunctionParameter:
         name = parts[-1]
         type = parts[-2]
         qualifiers = parts[:-2]
-        return cls(name, type, qualifiers)
+        return cls(name, type, qualifiers=qualifiers)
 
 
     def __init__(self, name, type, original_type=None, qualifiers=None):
@@ -37,6 +37,16 @@ class FunctionParameter:
             self.qualifiers = qualifiers
 
     def resolve_type_aliases(self, aliases):
+        if self.type == 'indy_u8_t':
+            self.type = 'char'
+            return
+        elif self.type == 'indy_u8_t*':
+            self.type = 'char*'
+            return
+        elif self.type == 'indy_bool_t':
+            self.type = 'bool'
+            return
+
         try:
             self.type = aliases[self.type]
         except KeyError:
@@ -55,6 +65,9 @@ class FunctionParameter:
 
     def __str__(self):
         return f'Name: {self.name} Type: {self.type}. Qualifiers: {self.qualifiers}'
+
+    def qualified_type(self):
+        return ' '.join(self.qualifiers) + ' ' + self.type
 
 
 
@@ -118,6 +131,8 @@ class IndyFunction:
         self.callback = callback
 
     def resolve_type_aliases(self, aliases):
+        if self.name == 'indy_crypto_sign':
+            print('REMOVE')
         self.return_type = aliases.get(self.return_type, self.return_type)
         for param in self.parameters:
             param.resolve_type_aliases(aliases)

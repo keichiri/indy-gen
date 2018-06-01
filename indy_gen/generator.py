@@ -73,3 +73,14 @@ class Generator:
             domain = header_file_name.replace('indy_', '').replace('.h', '')
             self._go_translator.translate(domain, declarations)
 
+    def generate_output_files_for_function(self, function_name):
+        declarations = self._header_parser.parse_indy_header_files()
+
+        for header_file_name, declarations in declarations.items():
+            for declaration in declarations.values():
+                if declaration.name == function_name:
+                    domain = header_file_name.replace('indy_', '').replace('.h', '')
+                    self._go_translator.translate_single(domain, declaration)
+                    return
+        else:
+            raise Exception(f'Unknown function: {function_name}')
